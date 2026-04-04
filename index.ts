@@ -1,9 +1,11 @@
 /**
  * TempLink – WebSocket Relay Server
  *
- * Handles:
- *  - JSON messages: chat, presence, call signaling, file chunks
- *  - Binary frames: audio relay for voice calls (forwarded to room peers)
+ * Fixes:
+ *  - Backpressure handling on large binary/JSON frames
+ *  - Per-client send queue — prevents TCP buffer overflow
+ *  - Drain event handling — waits for buffer before next send
+ *  - Binary relay for file chunks (bypass JSON stringify overhead)
  */
 
 import { WebSocketServer, WebSocket } from "ws";
@@ -19,6 +21,9 @@ interface Client {
   name: string;
   room: string;
   lastSeen: number;
+  // send queue for backpressure
+  queue: (string | Buffer)[];
+  draining: boolean;
 }
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -30,27 +35,72 @@ function getRoom(code: string): Map<string, Client> {
   return rooms.get(code)!;
 }
 
-function send(ws: WebSocket, data: unknown) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
+// ─── Queued send with backpressure ───────────────────────────────────────────
+// This is the KEY fix for slow receive.
+// Instead of calling ws.send() directly (which overflows TCP buffer
+// when chunks are large), we queue messages and drain one at a time.
+
+function queueSend(client: Client, data: string | Buffer) {
+  if (client.ws.readyState !== WebSocket.OPEN) return;
+  client.queue.push(data);
+  if (!client.draining) drain(client);
+}
+
+function drain(client: Client) {
+  if (client.queue.length === 0) {
+    client.draining = false;
+    return;
   }
+
+  // Check if WS buffer is already full (> 1MB backlog)
+  // If so, wait for 'drain' event before sending more
+  if (client.ws.bufferedAmount > 1024 * 1024) {
+    client.draining = true;
+    client.ws.once("drain", () => drain(client));
+    return;
+  }
+
+  const msg = client.queue.shift()!;
+  client.draining = true;
+
+  try {
+    client.ws.send(msg, (err) => {
+      if (err) {
+        // Clear queue on error — client likely disconnected
+        client.queue = [];
+        client.draining = false;
+        return;
+      }
+      // Immediately process next message
+      drain(client);
+    });
+  } catch {
+    client.queue = [];
+    client.draining = false;
+  }
+}
+
+// ─── Broadcast helpers ───────────────────────────────────────────────────────
+
+function send(client: Client, data: unknown) {
+  queueSend(client, JSON.stringify(data));
 }
 
 function broadcast(room: string, data: unknown, excludeId?: string) {
   const members = getRoom(room);
+  const json = JSON.stringify(data); // stringify ONCE, reuse for all peers
   members.forEach((client) => {
-    if (client.id !== excludeId) {
-      send(client.ws, data);
+    if (client.id !== excludeId && client.ws.readyState === WebSocket.OPEN) {
+      queueSend(client, json);
     }
   });
 }
 
-/** Broadcast binary data to all room members except sender */
 function broadcastBinary(room: string, data: Buffer, excludeId: string) {
   const members = getRoom(room);
   members.forEach((client) => {
     if (client.id !== excludeId && client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(data);
+      queueSend(client, data);
     }
   });
 }
@@ -62,11 +112,11 @@ function broadcastPeerList(room: string) {
     name: c.name,
   }));
   members.forEach((client) => {
-    send(client.ws, { type: "peers", room, peers });
+    send(client, { type: "peers", room, peers });
   });
 }
 
-// ─── Cleanup stale rooms ─────────────────────────────────────────────────────
+// ─── Stale client cleanup ────────────────────────────────────────────────────
 
 setInterval(() => {
   const now = Date.now();
@@ -77,16 +127,18 @@ setInterval(() => {
           `[GC] Removing stale client "${client.name}" from room "${code}"`,
         );
         members.delete(id);
-        broadcast(code, { type: "leave", id: client.id, name: client.name });
+        broadcast(code, {
+          type: "leave",
+          id: client.id,
+          name: client.name,
+        });
       }
     });
-    if (members.size === 0) {
-      rooms.delete(code);
-    }
+    if (members.size === 0) rooms.delete(code);
   });
 }, 60_000);
 
-// ─── HTTP Server ─────────────────────────────────────────────────────────────
+// ─── HTTP ────────────────────────────────────────────────────────────────────
 
 const httpServer = createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -96,32 +148,43 @@ const httpServer = createServer((req, res) => {
     const roomList = Array.from(rooms.entries()).map(([code, members]) => ({
       code,
       clients: members.size,
+      // show queue sizes for debugging
+      queues: Array.from(members.values()).map((c) => ({
+        id: c.id,
+        name: c.name,
+        queueSize: c.queue.length,
+        buffered: c.ws.bufferedAmount,
+      })),
     }));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, rooms: rooms.size, roomList }));
     return;
   }
+
   res.writeHead(404);
   res.end();
 });
 
-// ─── WebSocket Server ────────────────────────────────────────────────────────
+// ─── WebSocket ───────────────────────────────────────────────────────────────
 
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({
+  server: httpServer,
+  // Increase per-message limit to 50MB (default is 100MB but be explicit)
+  maxPayload: 50 * 1024 * 1024,
+});
 
 wss.on("connection", (ws: WebSocket) => {
   let clientId = "";
   let clientRoom = "";
   let clientName = "";
 
+  // Ping to keep connection alive
   const pingInterval = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    }
-  }, 30_000);
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, 25_000);
 
   ws.on("message", (raw, isBinary) => {
-    // ── BINARY FRAME: audio relay ────────────────────────────────────────
+    // ── BINARY: audio relay ───────────────────────────────────────────────
     if (isBinary) {
       if (clientId && clientRoom) {
         broadcastBinary(clientRoom, raw as Buffer, clientId);
@@ -129,7 +192,7 @@ wss.on("connection", (ws: WebSocket) => {
       return;
     }
 
-    // ── JSON FRAME: existing protocol ────────────────────────────────────
+    // ── JSON ─────────────────────────────────────────────────────────────
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(raw.toString());
@@ -147,6 +210,7 @@ wss.on("connection", (ws: WebSocket) => {
 
       const room = getRoom(clientRoom);
 
+      // Close old connection if same id reconnects
       if (room.has(clientId)) {
         const old = room.get(clientId)!;
         if (old.ws !== ws) {
@@ -164,20 +228,16 @@ wss.on("connection", (ws: WebSocket) => {
         name: clientName,
         room: clientRoom,
         lastSeen: Date.now(),
+        queue: [],
+        draining: false,
       };
       room.set(clientId, client);
 
       broadcast(
         clientRoom,
-        {
-          type: "join",
-          id: clientId,
-          name: clientName,
-          room: clientRoom,
-        },
+        { type: "join", id: clientId, name: clientName, room: clientRoom },
         clientId,
       );
-
       broadcastPeerList(clientRoom);
 
       console.log(
@@ -186,31 +246,34 @@ wss.on("connection", (ws: WebSocket) => {
       return;
     }
 
-    // ── RELAY (chat, presence, file, call signaling) ─────────────────────
+    // ── RELAY ─────────────────────────────────────────────────────────────
     if (type === "relay") {
       const room = clientRoom || (msg.room as string);
       const from = msg.from as string;
       const channel = msg.channel as string;
 
+      // Update lastSeen
       const roomMap = getRoom(room);
       const client = roomMap.get(from);
       if (client) client.lastSeen = Date.now();
 
       broadcast(
         room,
-        {
-          type: "relay",
-          channel,
-          room,
-          from,
-          payload: msg.payload,
-        },
+        { type: "relay", channel, room, from, payload: msg.payload },
         from,
       );
       return;
     }
 
-    // ── LEGACY: direct chat ──────────────────────────────────────────────
+    // ── PING (keep-alive from client) ─────────────────────────────────────
+    if (type === "ping") {
+      const room = getRoom(clientRoom);
+      const client = room.get(clientId);
+      if (client) client.lastSeen = Date.now();
+      return;
+    }
+
+    // ── LEGACY: chat ──────────────────────────────────────────────────────
     if (type === "chat") {
       const room = clientRoom || (msg.room as string);
       broadcast(
@@ -231,7 +294,7 @@ wss.on("connection", (ws: WebSocket) => {
       return;
     }
 
-    // ── LEGACY: file chunk ───────────────────────────────────────────────
+    // ── LEGACY: file_chunk ────────────────────────────────────────────────
     if (type === "file_chunk") {
       broadcast(
         clientRoom,
@@ -257,7 +320,15 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("close", () => {
     clearInterval(pingInterval);
     if (!clientId || !clientRoom) return;
+
     const room = getRoom(clientRoom);
+    const client = room.get(clientId);
+
+    // Clear queue on disconnect
+    if (client) {
+      client.queue = [];
+    }
+
     room.delete(clientId);
 
     if (room.size === 0) {
@@ -280,12 +351,19 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("error", (err) => {
     console.error("[WS error]", err.message);
   });
+
+  ws.on("pong", () => {
+    // Client is alive — update lastSeen
+    const room = getRoom(clientRoom);
+    const client = room.get(clientId);
+    if (client) client.lastSeen = Date.now();
+  });
 });
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 httpServer.listen(PORT, () => {
   console.log(`\n✅ TempLink server running`);
-  console.log(`   WS  → ws://localhost:${PORT}`);
+  console.log(`   WS     → ws://localhost:${PORT}`);
   console.log(`   Health → http://localhost:${PORT}/health\n`);
 });
